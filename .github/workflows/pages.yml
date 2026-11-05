@@ -1,0 +1,49 @@
+# main에 올리면 정답 테스트를 먼저 돌리고, 통과했을 때만 GitHub Pages에 배포한다.
+name: 테스트 후 배포
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 정답 테스트(node --test)
+        run: node --test tests/
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      # 앱 파일만 공개 사이트에 올린다(작업 기록 docs/, CLAUDE.md는 저장소에만 둠)
+      - name: 배포할 파일 모으기
+        run: |
+          mkdir _site
+          cp -r index.html style.css manifest.webmanifest sw.js .nojekyll icons src data tests _site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
