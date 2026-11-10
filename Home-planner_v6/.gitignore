@@ -1,0 +1,4 @@
+# 개발용 미리보기 설정
+.claude/
+.DS_Store
+node_modules/

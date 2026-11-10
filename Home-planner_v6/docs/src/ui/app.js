@@ -1,0 +1,369 @@
+/*
+ * 앱 셸: 상태 불러오기, 파생값 계산, 화면 그리기, 이벤트 위임.
+ * 화면 모듈은 ui.screens[이름](ctx) → HTML, ui.actions[이름](ctx, el, ev)로 등록한다.
+ */
+(function (root) {
+  'use strict';
+
+  var P = root.Planner;
+  var ui = P.ui;
+  var dates = P.dates;
+
+  var VIEW_KEY = 'jaemu-planner-view';
+  var app = (ui.app = {
+    store: null,
+    state: null,
+    d: null,
+    // screen: 'intake'(고객정보 입력) → 'choose'(고객용·설계사용 선택) → 'main'(각 화면)
+    view: { screen: 'choose', role: 'customer', tab: 'home', more: null, recordMonth: null, confirm: null, tx: null, plannerPage: 'overview' }
+  });
+
+  /* ---------- 화면 위치 기억(개인 편의, 실패해도 무관) ---------- */
+  function loadView() {
+    try {
+      var v = JSON.parse(root.localStorage.getItem(VIEW_KEY) || 'null');
+      if (v && (v.role === 'customer' || v.role === 'planner')) app.view.role = v.role;
+      if (v && typeof v.tab === 'string') app.view.tab = v.tab;
+      if (v && typeof v.plannerPage === 'string') app.view.plannerPage = v.plannerPage;
+    } catch (e) { /* 무시 */ }
+  }
+  function saveView() {
+    try {
+      root.localStorage.setItem(VIEW_KEY, JSON.stringify({ role: app.view.role, tab: app.view.tab, plannerPage: app.view.plannerPage }));
+    } catch (e) { /* 무시 */ }
+  }
+
+  function findPlan(s, id) {
+    return (s.plans || []).filter(function (p) { return p.id === id; })[0] || null;
+  }
+
+  /* ---------- 파생값(상태가 바뀔 때마다 한 번 계산) ---------- */
+  function derive(s) {
+    var pid = s.activePlanId;
+    var plan = findPlan(s, pid);
+    var paths = P.tracking.paths(s);
+    var current = paths.withRecords; // 기록 반영 후 계획대로
+    var today = P.tracking.today(s);
+    var month = today.slice(0, 7);
+    var next = dates.addMonths(month, 1);
+    var beforePlan = (s.plans || []).filter(function (p) { return p.kind === '설계 전'; }).slice(-1)[0] || null;
+    var before = beforePlan ? P.engine.runPlan(s, beforePlan.id) : null;
+    var recOpts = P.tracking.recordEngineOpts(s, pid, 'plan');
+    var solve = null;
+    try {
+      solve = P.solver.solveLivingCut(s, pid, { fromMonth: next, engineOpts: recOpts });
+    } catch (e) { solve = null; }
+    var proposals = s.proposals || [];
+    return {
+      pid: pid,
+      plan: plan,
+      paths: paths,
+      current: current,
+      today: today,
+      month: month,
+      next: next,
+      before: before,
+      beforePlan: beforePlan,
+      recOpts: recOpts,
+      solve: solve,
+      thisMonth: P.tracking.monthStatus(s, month),
+      pending: proposals.filter(function (p) { return p.status === '확인 대기' || p.status === '고객에게 제시됨'; }),
+      newAlerts: (s.alerts || []).filter(function (a) { return a.status === P.alerts.ALERT_STATUS.NEW; }).length,
+      issues: P.validate.validateState(s)
+    };
+  }
+
+  function ctx() {
+    // 고객정보 입력 전(상태 없음)에는 계산 없이 화면 정보만 넘긴다
+    if (!app.state) return { state: null, d: null, view: app.view, P: P, ui: ui, fmt: P.format, dates: dates };
+    if (!app.d) app.d = derive(app.state);
+    return { state: app.state, d: app.d, view: app.view, P: P, ui: ui, fmt: P.format, dates: dates };
+  }
+
+  /* ---------- 알림(방해금지 시간이면 토스트를 띄우지 않음) ---------- */
+  function inQuietHours(s) {
+    var q = s.settings && s.settings.notify && s.settings.notify.quiet;
+    if (!q || !q.enabled || !q.start || !q.end) return false;
+    var now = new Date();
+    var cur = now.getHours() * 60 + now.getMinutes();
+    var toMin = function (t) { var p = t.split(':'); return Number(p[0]) * 60 + Number(p[1]); };
+    var a = toMin(q.start);
+    var b = toMin(q.end);
+    return a <= b ? cur >= a && cur < b : cur >= a || cur < b;
+  }
+
+  function notifyAllowed(s, type) {
+    var n = (s.settings && s.settings.notify && s.settings.notify.types) || {};
+    return n[type] !== false;
+  }
+
+  var toastTimer = null;
+  ui.toast = function (msg) {
+    if (!msg) return;
+    var box = document.getElementById('toast');
+    if (!box) return;
+    box.innerHTML = '<div class="toast" role="status">' + ui.esc(msg) + '</div>';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { box.innerHTML = ''; }, 3200);
+  };
+
+  /**
+   * 상태 변경 확정: 경보 동기화 → (동의 시) 자동 적용 → 저장 → 다시 그리기.
+   */
+  ui.commit = function (newState, msg) {
+    var r = P.alerts.syncAlerts(newState);
+    var s = r.state;
+    var auto = P.alerts.autoApplyPending(s);
+    s = auto.state;
+    if (auto.applied.length) {
+      s = P.alerts.syncAlerts(s).state;
+      msg = (msg ? msg + ' ' : '') + '동의한 범위의 생활비 조정 ' + auto.applied.length + '건을 자동 적용했어요.';
+    }
+    app.state = s;
+    var saved = app.store.save(s);
+    app.d = null;
+    app.view.confirm = null;
+    ui.render();
+    if (!saved.ok) {
+      // 저장 실패를 성공처럼 알리지 않는다
+      ui.toast('저장하지 못했어요. 화면에는 반영됐지만 창을 닫으면 사라집니다. 내보내기(JSON)로 보관하세요.');
+      return;
+    }
+    var fresh = r.created.filter(function (id) {
+      var a = s.alerts.filter(function (x) { return x.id === id; })[0];
+      return a && notifyAllowed(s, a.type);
+    });
+    if (fresh.length && !inQuietHours(s)) msg = (msg ? msg + ' ' : '') + '새 알림 ' + fresh.length + '건이 있어요.';
+    ui.toast(msg);
+  };
+
+  ui.setView = function (patch, keepScroll) {
+    Object.assign(app.view, patch);
+    saveView();
+    ui.render();
+    if (!keepScroll) root.scrollTo(0, 0);
+  };
+
+  /* ---------- 공통 화면 조각 ---------- */
+  function header(c) {
+    var s = c.state;
+    var j = c.d.current.judgement;
+    var role = c.view.role;
+    return '<header class="topbar"><div class="topbar-inner">' +
+      '<div class="brand">재무플래너</div>' +
+      '<div class="seg" role="group" aria-label="보는 화면 바꾸기(화면 모드)">' +
+      '<button data-action="role" data-role="customer" aria-pressed="' + (role === 'customer') + '">고객용</button>' +
+      '<button data-action="role" data-role="planner" aria-pressed="' + (role === 'planner') + '">설계사용</button></div>' +
+      '<div class="topbar-actions"><button class="btn btn-sm" data-action="go-choose"><span class="lbl-long">화면 선택으로 돌아가기</span><span class="lbl-short" aria-hidden="true">화면 선택</span></button>' +
+      '<button class="btn btn-sm" data-action="edit-info"><span class="lbl-long">고객정보 수정</span><span class="lbl-short" aria-hidden="true">정보 수정</span></button></div>' +
+      '<div class="context-line"><span>고객 <strong>' + ui.esc(s.customer.name || '이름 없음') + '</strong>' + (s.customer.isExample ? ' ' + ui.badge('가상 고객', 'info') : '') + '</span>' +
+      '<span class="ctx-plan">실행 기준 <strong>' + ui.esc(c.d.plan ? c.d.plan.name : '없음') + '</strong></span>' +
+      '<span>' + ui.judgementBadge(j) + '</span></div>' +
+      '</div><div class="demo-note">' + (s.customer.isExample ? '가상 고객 데이터(설계 예시)입니다. 실제 금융정보가 아닙니다.' : '이 기기의 브라우저에만 저장돼요. 다른 기기와 자동으로 공유되지 않아요.') + '</div></header>';
+  }
+
+  function footer(c) {
+    var memory = app.store && app.store.mode === 'memory';
+    return '<footer class="footer">' +
+      (memory ? '<p class="notice warn" role="status"><span aria-hidden="true">!</span>이 브라우저에는 저장할 수 없어 창을 닫으면 입력이 사라집니다. 더보기 → 데이터 내보내기로 보관하세요.</p>' : '') +
+      '<details><summary>모든 문장은 계산 결과로 만들며 외부 AI를 쓰지 않습니다 · 자세히</summary>' +
+      '<p>모든 문장은 계산 결과로 만들며 외부 AI를 쓰지 않습니다. 금융상품 권유나 투자 조언이 아니며, 정책 조건은 확인일 기준이므로 가입·신청 전에 공식 기관에서 다시 확인하세요.</p></details>' +
+      '<p>기준일 ' + ui.esc(c.d.today) + ' · 단위 만원</p></footer>';
+  }
+
+  var TABS = [
+    { key: 'home', label: '홈', ico: '⌂' },
+    { key: 'record', label: '이번 달 기록', ico: '✎' },
+    { key: 'plan', label: '내 계획', ico: '◔' },
+    { key: 'alerts', label: '알림', ico: '◉' },
+    { key: 'more', label: '더보기', ico: '⋯' }
+  ];
+
+  function customerView(c) {
+    var tab = ui.screens[c.view.tab] ? c.view.tab : 'home';
+    var body = ui.screens[tab](c);
+    var bar = '<nav class="tabbar" aria-label="고객 화면 메뉴"><div class="tabbar-inner">' + TABS.map(function (t) {
+      var dot = t.key === 'alerts' && c.d.newAlerts ? '<span class="dot" aria-label="새 알림 ' + c.d.newAlerts + '건">' + c.d.newAlerts + '</span>' : '';
+      return '<button data-action="tab" data-tab="' + t.key + '"' + (tab === t.key ? ' aria-current="page"' : '') + '>' +
+        '<span class="ico" aria-hidden="true">' + t.ico + '</span>' + t.label + dot + '</button>';
+    }).join('') + '</div></nav>';
+    return '<main class="customer-main" id="main">' + body + '</main>' + bar;
+  }
+
+  function plannerView(c) {
+    if (ui.screens.planner) return ui.screens.planner(c);
+    return '<main class="planner-main"><div class="card"><h2>설계사 화면</h2><p class="muted">설계사 화면은 준비 중입니다. 고객 화면에서 시연을 확인해 주세요.</p></div></main>';
+  }
+
+  function staleNotice() {
+    if (!app.staleDemo) return '';
+    return '<div class="stale-note" role="status"><span>시연 데이터가 새 버전으로 바뀌었어요. 지금 보이는 값은 예전 시연 데이터를 바탕으로 한 저장본이에요.</span>' +
+      '<button class="btn btn-sm" data-action="reset-demo-confirm">새 시연 데이터로 초기화</button></div>';
+  }
+
+  function render() {
+    var el = document.getElementById('app');
+    if (!el) return;
+    var c;
+    if (ui.chartReset) ui.chartReset();
+    try {
+      if (!app.state || app.view.screen === 'intake') {
+        if (!app.state) app.view.intakeMode = 'new';
+        el.className = 'intake-view';
+        el.innerHTML = ui.intakeScreen();
+        return;
+      }
+      c = ctx();
+      if (app.view.screen === 'welcome') {
+        el.className = 'choose-view';
+        el.innerHTML = ui.welcomeScreen(c) + footer(c);
+        return;
+      }
+      if (app.view.screen === 'choose') {
+        el.className = 'choose-view';
+        el.innerHTML = ui.chooseScreen(c) + footer(c);
+        if (ui.mountCharts) ui.mountCharts();
+        return;
+      }
+      el.className = (c.view.role === 'customer' ? 'customer-view' : 'planner-view') + (c.view.tour !== null && c.view.tour !== undefined ? ' tour-on' : '');
+      el.innerHTML = header(c) + staleNotice() + (ui.importConfirm ? ui.importConfirm() : '') + (ui.reviewBanner ? '<div class="review-wrap">' + ui.reviewBanner(c) + '</div>' : '') +
+        (c.view.role === 'customer' ? customerView(c) : plannerView(c)) + footer(c) + (ui.tourPanel ? ui.tourPanel(c) : '');
+      if (ui.mountCharts) ui.mountCharts();
+    } catch (e) {
+      if (root.console) root.console.error(e);
+      el.className = '';
+      el.innerHTML = '<main class="customer-main">' + ui.errorBox('화면을 그리는 중 문제가 생겼어요. 다시 시도하거나 설계 예시로 되돌려 주세요.') + '</main>';
+    }
+  }
+  /* ---------- 화면 이동: 새 화면이면 맨 위로, 브라우저 뒤로가기 지원 ---------- */
+  var lastNav = null;
+  var fromPop = false;
+  function navOf(v) {
+    return { screen: v.screen, role: v.role, intakeMode: v.screen === 'intake' ? v.intakeMode : null };
+  }
+  function navKey(n) { return n.screen + '|' + (n.screen === 'main' ? n.role : n.screen === 'intake' ? n.intakeMode : ''); }
+  function renderNav() {
+    render();
+    var n = navOf(app.view);
+    if (!app.state) n = { screen: 'intake', role: app.view.role, intakeMode: 'new' };
+    var key = navKey(n);
+    if (lastNav === key) return;
+    var first = lastNav === null;
+    lastNav = key;
+    try {
+      if (root.history && root.history.pushState) {
+        if (first || fromPop) root.history.replaceState({ nav: n }, '');
+        else {
+          // 저장을 마치고 넘어간 경우: 뒤로 가면 '확인' 모드로 입력값이 보이게 앞 기록을 바꾼다
+          if (app.navReplacePrev) { root.history.replaceState({ nav: app.navReplacePrev }, ''); app.navReplacePrev = null; }
+          root.history.pushState({ nav: n }, '');
+        }
+      }
+    } catch (e) { /* 기록을 못 남겨도 화면은 그대로 */ }
+    if (!first) {
+      if (root.scrollTo) root.scrollTo(0, 0);
+      var h = document.querySelector ? document.querySelector('#app h1, #app .page-head h2, #app main h2') : null;
+      if (h && h.focus) { if (!h.hasAttribute('tabindex')) h.setAttribute('tabindex', '-1'); try { h.focus({ preventScroll: true }); } catch (e2) { /* 무시 */ } }
+    }
+  }
+  if (typeof root.addEventListener === 'function') {
+    root.addEventListener('popstate', function (e) {
+      var n = e.state && e.state.nav;
+      if (!n) return;
+      if (!app.state) n = { screen: 'intake', intakeMode: 'new', role: app.view.role };
+      app.view.screen = n.screen;
+      if (n.role) app.view.role = n.role;
+      if (n.screen === 'intake') {
+        app.view.intakeMode = n.intakeMode || 'review';
+        app.view.intakeDraft = null;
+        app.view.intakeErrors = null;
+        app.view.intakeSaveError = null;
+      }
+      fromPop = true;
+      lastNav = null === lastNav ? null : 'x';
+      renderNav();
+      fromPop = false;
+    });
+  }
+  ui.render = renderNav;
+
+  /* ---------- 공통 동작 ---------- */
+  Object.assign(ui.actions, {
+    role: function (c, el) { ui.setView({ role: el.getAttribute('data-role'), screen: 'main' }); },
+    tab: function (c, el) { ui.setView({ tab: el.getAttribute('data-tab'), more: null, confirm: null }); },
+    retry: function () { app.d = null; ui.render(); },
+    'reset-demo-confirm': function () { ui.setView({ screen: 'main', confirm: 'reset-demo', role: 'customer', tab: 'more', more: 'data' }); },
+    'reset-demo': function () {
+      var s = app.store.reset();
+      app.staleDemo = false;
+      app.view.tx = null;
+      ui.commit(s, '설계 예시로 되돌렸어요.');
+    },
+    'cancel-confirm': function () { ui.setView({ confirm: null }, true); }
+  });
+
+  function safe(fn) {
+    try {
+      fn();
+    } catch (e) {
+      if (root.console) root.console.error(e);
+      // 상태 함수가 던지는 오류는 사람이 읽는 문장이다
+      ui.toast(e && e.message && /[가-힣]/.test(e.message) ? e.message : '처리하지 못했어요. 다시 시도해 주세요.');
+    }
+  }
+
+  function bindEvents() {
+    document.addEventListener('click', function (e) {
+      var el = e.target.closest('[data-action]');
+      if (!el) return;
+      var fn = ui.actions[el.getAttribute('data-action')];
+      if (!fn) return;
+      e.preventDefault();
+      safe(function () { fn(ctx(), el, e); });
+    });
+    document.addEventListener('submit', function (e) {
+      var f = e.target.closest('form[data-submit]');
+      if (!f) return;
+      e.preventDefault();
+      var fn = ui.actions[f.getAttribute('data-submit')];
+      if (fn) safe(function () { fn(ctx(), f, new FormData(f)); });
+    });
+    document.addEventListener('change', function (e) {
+      var el = e.target.closest('[data-change]');
+      if (!el) return;
+      var fn = ui.actions[el.getAttribute('data-change')];
+      if (fn) safe(function () { fn(ctx(), el, e); });
+    });
+  }
+
+  function boot() {
+    app.store = P.store.createStore();
+    var loaded = app.store.load();
+    var s = loaded.state;
+    app.firstVisit = loaded.firstVisit;
+    app.staleDemo = !!loaded.staleDemo;
+    loadView();
+    if (s) {
+      s = P.alerts.syncAlerts(s).state;
+      app.state = s;
+      app.store.save(s); // 예전 저장본은 이전된 형식으로 다시 저장(삭제하지 않음)
+      app.view.screen = 'welcome'; // 다시 실행: 기존 정보로 계속 / 새 고객 시작 선택
+    } else {
+      app.state = null;
+      app.view.screen = 'intake'; // 처음 실행: 고객정보 입력부터
+      app.view.intakeMode = 'new';
+      if (loaded.corrupt) setTimeout(function () { ui.toast('저장된 데이터를 읽지 못했어요. 지우지 않고 백업해 두었어요. 새로 입력하거나 파일을 불러오세요.'); }, 0);
+    }
+    bindEvents();
+    renderNav();
+    if (app.store.mode === 'memory') ui.toast('이 브라우저에는 저장할 수 없어 이번 창에서만 유지돼요. 내보내기(JSON)로 보관하세요.');
+    // 서비스 워커는 https에서만(파일로 열면 등록하지 않음)
+    if (root.location && root.location.protocol === 'https:' && root.navigator && root.navigator.serviceWorker) {
+      try { root.navigator.serviceWorker.register('sw.js'); } catch (e) { /* 무시 */ }
+    }
+  }
+
+  ui.boot = boot;
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})(typeof globalThis !== 'undefined' ? globalThis : this);
